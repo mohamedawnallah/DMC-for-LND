@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
@@ -443,20 +444,83 @@ func isHistoryStale(history *ecrpc.PairData, threshold time.Duration) bool {
 }
 
 // mergePairData merges the pair data from two pairs based on the most recent
-// timestamp.
+// timestamp. It does the following:
+//   - It updates the success time and amounts if there are more recent history
+//     pairs, ensuring that the maximum success amount of the history pair is
+//     retained to prevent the success range from shrinking when unnecessary,
+//   - It prevents the failure from updating too soon based on the configured
+//     MinFailureRelaxInterval value.
+//   - It also adjusts the failure range if the success amount goes into the
+//     failure range and adjusts the success range if the failure amount goes
+//     into the success range.
+//
+// Parameters:
+// - existingData: The existing pair data to merge with.
+// - newData: The new pair data to merge with.
 func mergePairData(existingData, newData *ecrpc.PairData) {
-	// Update success time and amounts if the new data's success time is
-	// greater.
+
 	if newData.SuccessTime > existingData.SuccessTime {
+		// Update success time and amounts if newer, retaining max
+		// success amount to avoid shrinking success range
+		// unnecessarily.
 		existingData.SuccessTime = newData.SuccessTime
-		existingData.SuccessAmtSat = newData.SuccessAmtSat
-		existingData.SuccessAmtMsat = newData.SuccessAmtMsat
+		existingData.SuccessAmtSat = int64(math.Max(
+			float64(existingData.SuccessAmtSat),
+			float64(newData.SuccessAmtSat),
+		))
+		existingData.SuccessAmtMsat = int64(math.Max(
+			float64(existingData.SuccessAmtMsat),
+			float64(newData.SuccessAmtMsat),
+		))
+
+		// Move the failure range up if the success amount goes into the
+		// failure range. We don't want to clear the failure completely
+		// because we haven't learnt much for amounts above the current
+		// success amount.
+		if existingData.FailTime != 0 &&
+			newData.SuccessAmtSat >= existingData.FailAmtSat {
+			existingData.FailAmtSat = newData.SuccessAmtSat + 1
+			existingData.FailAmtMsat = newData.SuccessAmtMsat + 1
+		}
 	}
 
-	// Update fail time and amounts if the new data's fail time is greater.
 	if newData.FailTime > existingData.FailTime {
+		// Drop result if it would increase the failure amount too soon
+		// after a previous failure. This can happen if htlc results
+		// come in out of order. This check makes it easier for payment
+		// processes to converge to a final state
+		newFailureTimestamp := time.Unix(newData.FailTime, 0)
+		currentFailureTimestamp := time.Unix(existingData.FailTime, 0)
+		failInterval := newFailureTimestamp.Sub(currentFailureTimestamp)
+		if newData.FailAmtSat > existingData.FailAmtSat &&
+			failInterval < MinFailureRelaxInterval {
+			logrus.Debugf("Ignoring higher amount failure within "+
+				"min failure relaxation interval: "+
+				"prev_fail_amt=%v, fail_amt=%v, interval=%v",
+				existingData.FailAmtSat, newData.FailAmtSat,
+				failInterval)
+			return
+		}
+
 		existingData.FailTime = newData.FailTime
 		existingData.FailAmtSat = newData.FailAmtSat
 		existingData.FailAmtMsat = newData.FailAmtMsat
+
+		switch {
+		// The failure amount is set to zero when the failure is
+		// amount-independent, meaning that the attempt would have
+		// failed regardless of the amount. This should also reset the
+		// success amount to zero.
+		case newData.FailAmtSat == 0:
+			existingData.SuccessAmtSat = 0
+			existingData.SuccessAmtMsat = 0
+
+		// If the failure range goes into the success range, move the
+		// success range down.
+		case newData.FailAmtSat <= existingData.SuccessAmtSat:
+			existingData.SuccessAmtSat = newData.FailAmtSat - 1
+			existingData.SuccessAmtMsat = newData.FailAmtMsat - 1
+		}
+
 	}
 }
