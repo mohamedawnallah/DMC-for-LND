@@ -16,6 +16,16 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	// PubKeyCompressedSize is the size of a single compressed sec pub key
+	// in bytes.
+	PubKeyCompressedSize = 33
+
+	// PubKeysCompressedSize is the size of compressed sec pub keys for both
+	// the source and destination nodes in the mission control data pair.
+	PubKeysCompressedSize = PubKeyCompressedSize * 2
+)
+
 // externalCoordinatorServer provides methods to register and query mission
 // control data.
 type externalCoordinatorServer struct {
@@ -57,7 +67,7 @@ func (s *externalCoordinatorServer) RegisterMissionControl(ctx context.Context,
 	}
 
 	// Initialize a map to aggregate mission control data.
-	aggregatedData := make(map[[66]byte]*ecrpc.PairData)
+	aggregatedData := make(map[[PubKeysCompressedSize]byte]*ecrpc.PairData)
 
 	// Use Batch over Update to reduce tx commits overhead and database
 	// locking, enhancing performance and responsiveness under high write
@@ -76,7 +86,7 @@ func (s *externalCoordinatorServer) RegisterMissionControl(ctx context.Context,
 				return status.Errorf(codes.Internal, msg, err)
 			}
 
-			aggregatedData[[66]byte(k)] = history
+			aggregatedData[[PubKeysCompressedSize]byte(k)] = history
 
 			return nil
 		})
@@ -91,7 +101,9 @@ func (s *externalCoordinatorServer) RegisterMissionControl(ctx context.Context,
 		// Aggregate all data in the database with user registered data.
 		for _, pair := range req.Pairs {
 			// Aggregate the data based on the key.
-			key := [66]byte(append(pair.NodeFrom, pair.NodeTo...))
+			key := [PubKeysCompressedSize]byte(
+				append(pair.NodeFrom, pair.NodeTo...),
+			)
 
 			if existingData, ok := aggregatedData[key]; ok {
 				// If data for the key exists, merge it with
@@ -180,9 +192,11 @@ func (s *externalCoordinatorServer) QueryAggregatedMissionControl(
 				return status.Errorf(codes.Internal, msg, err)
 			}
 
+			nodeFrom := k[:PubKeyCompressedSize]
+			nodeTo := k[PubKeyCompressedSize:]
 			pair := &ecrpc.PairHistory{
-				NodeFrom: k[:33],
-				NodeTo:   k[33:],
+				NodeFrom: nodeFrom,
+				NodeTo:   nodeTo,
 				History:  history,
 			}
 			pairs = append(pairs, pair)
@@ -314,17 +328,19 @@ func (s *externalCoordinatorServer) validateRegisterMissionControlRequest(req *e
 	for _, pair := range req.Pairs {
 		// Validate that NodeFrom is exactly 33 bytes i.e compressed sec
 		// pub key.
-		if len(pair.NodeFrom) != 33 {
+		if len(pair.NodeFrom) != PubKeyCompressedSize {
 			return status.Errorf(codes.InvalidArgument, "NodeFrom "+
-				"must be exactly 33 bytes",
+				"must be exactly %d bytes",
+				PubKeyCompressedSize,
 			)
 		}
 
 		// Validate that NodeTo is exactly 33 bytes i.e compressed sec
 		// pub key.
-		if len(pair.NodeTo) != 33 {
+		if len(pair.NodeTo) != PubKeyCompressedSize {
 			return status.Errorf(codes.InvalidArgument, "NodeTo "+
-				"must be exactly 33 bytes",
+				"must be exactly %d bytes",
+				PubKeyCompressedSize,
 			)
 		}
 
